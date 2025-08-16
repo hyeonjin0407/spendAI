@@ -6,22 +6,17 @@ import pandas as pd
 import os
 import json
 from pathlib import Path
-
-# ---- (옵션) TensorFlow 임포트: 실패해도 서버는 뜨도록 ----
-TF_AVAILABLE = True
-try:
-    from tensorflow.keras.models import load_model
-except Exception as _tf_err:
-    TF_AVAILABLE = False
+from tensorflow.keras.models import load_model  # << TensorFlow 필수 임포트
 
 app = Flask(__name__, static_folder=None)  # static_folder는 직접 라우팅
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 # -----------------------------------------
-# 데이터 저장 경로: spendAI/xpend/data
+# 경로 셋업
 # -----------------------------------------
 THIS_FILE = Path(__file__).resolve()
 
+# 데이터 저장 경로
 DATA_DIR_CANDIDATES = [
     THIS_FILE.parent / "spendAI" / "xpend" / "data",
     THIS_FILE.parent.parent / "spendAI" / "xpend" / "data",
@@ -30,17 +25,14 @@ DATA_DIR_CANDIDATES = [
 DATA_DIR = next((p for p in DATA_DIR_CANDIDATES if p.exists()), DATA_DIR_CANDIDATES[-1])
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+# ★ 모델/전처리기: code/model/ 경로 고정
 MODEL_PATH = (THIS_FILE.parent / "model" / "regret_model.keras").resolve()
 PREP_PATH  = (THIS_FILE.parent / "model" / "preprocessor.pkl").resolve()
-
 
 DATA_FILE = DATA_DIR / "purchase_data.csv"
 PREF_FILE = DATA_DIR / "user_preferences.json"
 
-# -----------------------------------------
-# Flutter 웹 빌드 결과 경로(web root)
-# (Render에선 보통 프론트는 따로 서빙하지만, 로컬겸용 유지)
-# -----------------------------------------
+# Flutter 웹 빌드 경로(있으면 서비스)
 WEB_DIR_CANDIDATES = [
     THIS_FILE.parent / "web",
     THIS_FILE.parent.parent / "my_consume_app" / "build" / "web",
@@ -53,35 +45,37 @@ else:
     print(f"[INFO] Serving Flutter web from: {WEB_ROOT}")
 
 # -----------------------------------------
-# 모델 로드 (실패해도 서버는 계속 뜸)
+# 모델 로드 (실패 시 서버는 뜨지만 /predict는 500 반환)
 # -----------------------------------------
 model = None
 preprocessor = None
+load_error = None
+
 try:
-    if TF_AVAILABLE and MODEL_PATH.exists() and PREP_PATH.exists():
-        model = load_model(str(MODEL_PATH))
-        preprocessor = joblib.load(str(PREP_PATH))
-        print("[INFO] Model & Preprocessor loaded.")
-    else:
-        if not TF_AVAILABLE:
-            print("[WARN] TensorFlow not available; predict will return dummy values.")
-        if not MODEL_PATH.exists():
-            print(f"[WARN] MODEL_PATH not found: {MODEL_PATH}")
-        if not PREP_PATH.exists():
-            print(f"[WARN] PREP_PATH not found: {PREP_PATH}")
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(f"MODEL_PATH not found: {MODEL_PATH}")
+    if not PREP_PATH.exists():
+        raise FileNotFoundError(f"PREP_PATH not found: {PREP_PATH}")
+
+    model = load_model(str(MODEL_PATH))
+    preprocessor = joblib.load(str(PREP_PATH))
+    print("[INFO] Model & Preprocessor loaded.")
 except Exception as e:
-    print(f"[WARN] Failed to load model/preprocessor: {e}")
+    load_error = str(e)
+    print(f"[WARN] Failed to load model/preprocessor: {load_error}")
 
 # -----------------------------------------
 # Health
 # -----------------------------------------
 @app.route('/health', methods=['GET'])
 def health():
-    ok = model is not None and preprocessor is not None
+    ok = (model is not None) and (preprocessor is not None)
     return jsonify({
         "status": "ok" if ok else "model_not_loaded",
         "model_loaded": ok,
-        "tf_available": TF_AVAILABLE
+        "model_path": str(MODEL_PATH),
+        "prep_path": str(PREP_PATH),
+        "load_error": None if ok else load_error
     })
 
 # -----------------------------------------
@@ -89,26 +83,18 @@ def health():
 # -----------------------------------------
 @app.route('/predict', methods=['POST'])
 def predict():
-    """
-    - 모델/전처리기가 없으면 더미값으로 200 응답을 반환 (배포/고정주소 확인용)
-    - 나중에 실제 모델 배포 시, 아래 dummy 로직을 제거/주석처리하면 됨
-    """
     try:
+        # 모델 없으면 에러로 명확히 반환
+        if model is None or preprocessor is None:
+            return jsonify({'error': f'Model or preprocessor not loaded on server: {load_error}'}), 500
+
         data = request.get_json(force=True, silent=True) or {}
         required_fields = ['금액(원)', '당시 기분', '항목', '구매 이유', '요일', '월']
         missing = [f for f in required_fields if f not in data]
         if missing:
             return jsonify({'error': f"Missing field(s): {', '.join(missing)}"}), 400
 
-        # ---- 모델이 준비되지 않은 경우: 더미 응답 ----
-        if model is None or preprocessor is None:
-            return jsonify({
-                'regret_probability': 0.42,                # 임시 더미값
-                'user_type': data.get('user_type', None),
-                'note': 'dummy response (model not loaded on server)'
-            }), 200
-
-        # ---- 실제 추론 ----
+        # 입력 → DataFrame → 전처리 → 예측
         input_df = pd.DataFrame({k: [data[k]] for k in required_fields})
         input_processed = preprocessor.transform(input_df)
         pred_prob = model.predict(input_processed)[0][0]
@@ -143,7 +129,6 @@ def save_data():
         }
 
         df_new = pd.DataFrame([record])
-
         if DATA_FILE.exists():
             df_new.to_csv(DATA_FILE, mode='a', index=False, header=False, encoding='utf-8-sig')
         else:
@@ -191,18 +176,11 @@ def _serve_index():
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def serve_spa(path):
-    """
-    - /, /index.html → index.html
-    - /assets/... 등 실제 파일 경로 존재 → 해당 파일
-    - 그 외 SPA 라우팅 → index.html
-    """
     if WEB_ROOT is None:
         return jsonify({"error": "Flutter web build folder not found."}), 500
-
     target = (WEB_ROOT / path).resolve()
     if path and target.exists() and target.is_file() and WEB_ROOT in target.parents:
         return send_from_directory(WEB_ROOT, path)
-
     return _serve_index()
 
 # -----------------------------------------
