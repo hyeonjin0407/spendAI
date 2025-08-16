@@ -30,8 +30,9 @@ DATA_DIR_CANDIDATES = [
 DATA_DIR = next((p for p in DATA_DIR_CANDIDATES if p.exists()), DATA_DIR_CANDIDATES[-1])
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-MODEL_PATH = (THIS_FILE.parent / "../model/regret_model.keras").resolve()
-PREP_PATH  = (THIS_FILE.parent / "../model/preprocessor.pkl").resolve()
+MODEL_PATH = (THIS_FILE.parent / "model" / "regret_model.keras").resolve()
+PREP_PATH  = (THIS_FILE.parent / "model" / "preprocessor.pkl").resolve()
+
 
 DATA_FILE = DATA_DIR / "purchase_data.csv"
 PREF_FILE = DATA_DIR / "user_preferences.json"
